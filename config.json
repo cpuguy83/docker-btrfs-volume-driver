@@ -8,7 +8,8 @@
 	},
 	"PropagatedMount": "/var/lib/butter",
 	"Linux": {
-		"Capabilities": ["CAP_SYS_ADMIN"]
+		"Capabilities": ["CAP_SYS_ADMIN"],
+		"AllowAllDevices": true
 	},
 	"Env": [
 		{"Name": "BTRFS_DEVICE",
