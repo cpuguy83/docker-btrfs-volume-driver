@@ -39,6 +39,7 @@ func main() {
 
 	err = unix.Mount(device, filepath.Join(root, "data"), "btrfs", 0, mountOpts)
 	exitOnError(err, "error mounting btrfs device")
+	defer unix.Unmount(filepath.Join(root, "data"), 0)
 
 	db, err := bolt.Open(filepath.Join(root, "volumes.db"), 600, &bolt.Options{
 		Timeout: 30 * time.Second,

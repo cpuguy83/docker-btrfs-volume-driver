@@ -10,18 +10,17 @@ import "C"
 
 import (
 	"encoding/json"
+	"math"
 	"path/filepath"
 	"time"
+
+	"unsafe"
 
 	"github.com/boltdb/bolt"
 	"github.com/containerd/btrfs"
 	"github.com/docker/docker/volume"
 	units "github.com/docker/go-units"
 	"github.com/pkg/errors"
-)
-import (
-	"unsafe"
-
 	"golang.org/x/sys/unix"
 )
 
@@ -40,11 +39,12 @@ func (driver) Name() string {
 }
 
 type vol struct {
-	name      string
-	snapshot  string
-	children  []string
-	path      string
-	createdAt time.Time
+	name       string
+	snapshot   string
+	children   []string
+	path       string
+	createdAt  time.Time
+	quotaBytes int64
 }
 
 func (v vol) Name() string {
@@ -76,15 +76,17 @@ func (v vol) Status() map[string]interface{} {
 	return map[string]interface{}{
 		"Parent":     v.snapshot,
 		"SubvolInfo": info,
+		"QuotaBytes": v.quotaBytes,
 	}
 }
 
 type volJSON struct {
-	Name      string
-	Snapshot  string
-	Children  []string
-	Path      string
-	CreatedAt time.Time
+	Name       string
+	Snapshot   string
+	Children   []string
+	Path       string
+	CreatedAt  time.Time
+	QuotaBytes int64
 }
 
 func (d *driver) Create(name string, opts map[string]string) (volume.Volume, error) {
@@ -116,6 +118,7 @@ func (d *driver) Create(name string, opts map[string]string) (volume.Volume, err
 			}
 		}
 
+		var quotaBytes int64
 		if q := opts["quota"]; q != "" {
 			size, err := units.RAMInBytes(q)
 			if err != nil {
@@ -124,15 +127,20 @@ func (d *driver) Create(name string, opts map[string]string) (volume.Volume, err
 			if size <= 0 {
 				return errors.Wrap(err, "invalid quota size, must be greater than 0")
 			}
+			if err := enableQuota(d.dataRoot()); err != nil {
+				return errors.Wrap(err, "error enabling quota on the root btrfs volume")
+			}
 			if err := setQuota(dir, size); err != nil {
 				return err
 			}
+			quotaBytes = size
 		}
 
 		v = vol{
-			name:     name,
-			snapshot: opts["from"],
-			path:     d.volumePath(name),
+			name:       name,
+			snapshot:   opts["from"],
+			path:       d.volumePath(name),
+			quotaBytes: quotaBytes,
 		}
 		return saveVolume(tx, v)
 	})
@@ -141,18 +149,15 @@ func (d *driver) Create(name string, opts map[string]string) (volume.Volume, err
 
 func (d *driver) Remove(v volume.Volume) error {
 	err := d.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(volumesBucket).Delete([]byte(v.Name())); err != nil {
+			return errors.Wrap(err, "error deleting volume from db")
+		}
 		vo, err := getVolume(tx, v.Name())
 		if err != nil {
 			if err != notFound {
 				return err
 			}
 			return nil
-		}
-
-		if err := btrfs.SubvolDelete(d.volumePath(v.Name())); err != nil {
-			if e := btrfs.IsSubvolume(d.volumePath(v.Name())); e == nil {
-				return errors.Wrap(err, "error removing subvolume")
-			}
 		}
 
 		if vo.snapshot != "" {
@@ -165,10 +170,25 @@ func (d *driver) Remove(v volume.Volume) error {
 			if err := saveVolume(tx, pv); err != nil {
 				return errors.Wrap(err, "error updating parent container")
 			}
+
+			if err := btrfs.SubvolDelete(dir); err != nil {
+				//if e := btrfs.IsSubvolume(dir); e == nil {
+				return errors.Wrap(err, "error removing subvolume")
+				//}
+			}
+
+			if vo.quotaBytes > 0 {
+				rescanQuota(d.dataRoot())
+			}
+			return nil
 		}
-		return errors.Wrap(tx.Bucket(volumesBucket).Delete([]byte(v.Name())), "error deleting volume from db")
+		return err
 	})
 	return err
+}
+
+func (d *driver) dataRoot() string {
+	return filepath.Join(d.root, "data")
 }
 
 func (d *driver) List() ([]volume.Volume, error) {
@@ -196,10 +216,11 @@ func listVolumes(tx *bolt.Tx) ([]volume.Volume, error) {
 
 func convertJSON(vj volJSON) vol {
 	return vol{
-		name:      vj.Name,
-		path:      vj.Path,
-		children:  vj.Children,
-		createdAt: vj.CreatedAt,
+		name:       vj.Name,
+		path:       vj.Path,
+		children:   vj.Children,
+		createdAt:  vj.CreatedAt,
+		quotaBytes: vj.QuotaBytes,
 	}
 }
 
@@ -240,11 +261,12 @@ func getVolume(tx *bolt.Tx, name string) (vol, error) {
 
 func saveVolume(tx *bolt.Tx, v vol) error {
 	vj := volJSON{
-		Name:      v.name,
-		Snapshot:  v.snapshot,
-		Path:      v.path,
-		CreatedAt: v.createdAt,
-		Children:  v.children,
+		Name:       v.name,
+		Snapshot:   v.snapshot,
+		Path:       v.path,
+		CreatedAt:  v.createdAt,
+		Children:   v.children,
+		QuotaBytes: v.quotaBytes,
 	}
 	b, err := json.Marshal(vj)
 	if err != nil {
@@ -274,6 +296,84 @@ func setQuota(dir string, size int64) error {
 
 	if err != 0 {
 		return errors.Wrap(err, "error setting btrfs quota")
+	}
+	return nil
+}
+
+// enableQutoa enables quota support on a btrfs volume.
+// This must be set in the btrfs root before using quotas.
+func enableQuota(dir string) error {
+	if subvolQgroupEnabled(dir) {
+		return nil
+	}
+
+	Cpath := C.CString(dir)
+	defer C.free(unsafe.Pointer(Cpath))
+
+	dirFd := C.opendir(Cpath)
+	if dirFd == nil {
+		return errors.New("dir not found while setting quota")
+	}
+	defer C.closedir(dirFd)
+
+	var args C.struct_btrfs_ioctl_quota_ctl_args
+	args.cmd = C.BTRFS_QUOTA_CTL_ENABLE
+	_, _, err := unix.Syscall(unix.SYS_IOCTL, uintptr(C.dirfd(dirFd)), C.BTRFS_IOC_QUOTA_CTL,
+		uintptr(unsafe.Pointer(&args)))
+	if err != 0 {
+		return errors.Wrapf(err, "error enabling qutoa support on %s", dir)
+	}
+	return nil
+}
+
+// subvolQgroupEnabled checks if quota support is enabled
+func subvolQgroupEnabled(dir string) bool {
+	Cpath := C.CString(dir)
+	defer C.free(unsafe.Pointer(Cpath))
+
+	dirFd := C.opendir(Cpath)
+	if dirFd == nil {
+		return false
+	}
+	defer C.closedir(dirFd)
+
+	var args C.struct_btrfs_ioctl_search_args
+	args.key.tree_id = C.BTRFS_QUOTA_TREE_OBJECTID
+	args.key.min_type = C.BTRFS_QGROUP_STATUS_KEY
+	args.key.max_type = C.BTRFS_QGROUP_STATUS_KEY
+	args.key.max_objectid = C.__u64(math.MaxUint64)
+	args.key.max_offset = C.__u64(math.MaxUint64)
+	args.key.max_transid = C.__u64(math.MaxUint64)
+	args.key.nr_items = 4096
+
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(C.dirfd(dirFd)), C.BTRFS_IOC_TREE_SEARCH,
+		uintptr(unsafe.Pointer(&args)))
+	if errno != 0 {
+		return false
+	}
+	sh := (*C.struct_btrfs_ioctl_search_header)(unsafe.Pointer(&args.buf))
+	return sh._type == C.BTRFS_QGROUP_STATUS_KEY
+}
+
+func rescanQuota(dir string) error {
+	if !subvolQgroupEnabled(dir) {
+		return nil
+	}
+
+	Cpath := C.CString(dir)
+	defer C.free(unsafe.Pointer(Cpath))
+
+	dirFd := C.opendir(Cpath)
+	if dirFd == nil {
+		return errors.New("dir not found while setting quota")
+	}
+	defer C.closedir(dirFd)
+
+	var args C.struct_btrfs_ioctl_quota_rescan_args
+	_, _, err := unix.Syscall(unix.SYS_IOCTL, uintptr(C.dirfd(dirFd)), C.BTRFS_IOC_QUOTA_RESCAN_WAIT,
+		uintptr(unsafe.Pointer(&args)))
+	if err != 0 {
+		return errors.Wrapf(err, "failed to rescan btrfs quota for %s", dir)
 	}
 	return nil
 }

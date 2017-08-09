@@ -28,5 +28,8 @@
 			"destination": "/dev",
 			"options": ["rbind"]
 		}
-	]
+	],
+	"Network": {
+		"Type": "host"
+	}
 }
