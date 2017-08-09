@@ -1,5 +1,13 @@
 package main
 
+/*
+#include <stdlib.h>
+#include <dirent.h>
+#include <btrfs/ioctl.h>
+#include <btrfs/ctree.h>
+*/
+import "C"
+
 import (
 	"encoding/json"
 	"path/filepath"
@@ -8,7 +16,13 @@ import (
 	"github.com/boltdb/bolt"
 	"github.com/containerd/btrfs"
 	"github.com/docker/docker/volume"
+	units "github.com/docker/go-units"
 	"github.com/pkg/errors"
+)
+import (
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 var volumesBucket = []byte("volumes")
@@ -82,13 +96,14 @@ func (d *driver) Create(name string, opts map[string]string) (volume.Volume, err
 			return volumeExists
 		}
 
+		dir := d.volumePath(name)
 		if f := opts["from"]; f != "" {
 			from, err := getVolume(tx, f)
 			if err != nil {
 				return errors.Wrap(err, "error looking up from volume")
 			}
 
-			if err := btrfs.SubvolSnapshot(d.volumePath(name), d.volumePath(from.Name()), false); err != nil {
+			if err := btrfs.SubvolSnapshot(dir, d.volumePath(from.Name()), false); err != nil {
 				return errors.Wrap(err, "error creating snapshot")
 			}
 			from.children = append(from.children, name)
@@ -96,8 +111,21 @@ func (d *driver) Create(name string, opts map[string]string) (volume.Volume, err
 				return errors.Wrap(err, "error updating parent volume")
 			}
 		} else {
-			if err := btrfs.SubvolCreate(d.volumePath(name)); err != nil {
+			if err := btrfs.SubvolCreate(dir); err != nil {
 				return errors.Wrap(err, "error creating btrfs subvolume")
+			}
+		}
+
+		if q := opts["quota"]; q != "" {
+			size, err := units.RAMInBytes(q)
+			if err != nil {
+				return errors.Wrap(err, "error parsing quota size")
+			}
+			if size <= 0 {
+				return errors.Wrap(err, "invalid quota size, must be greater than 0")
+			}
+			if err := setQuota(dir, size); err != nil {
+				return err
 			}
 		}
 
@@ -146,20 +174,24 @@ func (d *driver) Remove(v volume.Volume) error {
 func (d *driver) List() ([]volume.Volume, error) {
 	var ls []volume.Volume
 	err := d.db.View(func(tx *bolt.Tx) error {
-		err := tx.Bucket(volumesBucket).ForEach(func(key, value []byte) error {
-			var v volJSON
-			if err := json.Unmarshal(value, &v); err != nil {
-				return errors.Wrap(err, "error unmarshaling volume details")
-			}
-			ls = append(ls, convertJSON(v))
-			return nil
-		})
+		var err error
+		ls, err = listVolumes(tx)
 		return err
 	})
-	if err != nil {
-		return nil, err
-	}
-	return ls, nil
+	return ls, err
+}
+
+func listVolumes(tx *bolt.Tx) ([]volume.Volume, error) {
+	var ls []volume.Volume
+	err := tx.Bucket(volumesBucket).ForEach(func(key, value []byte) error {
+		var v volJSON
+		if err := json.Unmarshal(value, &v); err != nil {
+			return errors.Wrap(err, "error unmarshaling volume details")
+		}
+		ls = append(ls, convertJSON(v))
+		return nil
+	})
+	return ls, err
 }
 
 func convertJSON(vj volJSON) vol {
@@ -188,7 +220,7 @@ func (d *driver) Scope() string {
 	return "local"
 }
 
-func (d driver) volumePath(name string) string {
+func (d *driver) volumePath(name string) string {
 	return filepath.Join(d.root, "data", name)
 }
 
@@ -220,6 +252,28 @@ func saveVolume(tx *bolt.Tx, v vol) error {
 	}
 	if err := tx.Bucket(volumesBucket).Put([]byte(v.name), b); err != nil {
 		return errors.Wrap(err, "error saving volume details to db")
+	}
+	return nil
+}
+
+func setQuota(dir string, size int64) error {
+	Cpath := C.CString(dir)
+	defer C.free(unsafe.Pointer(Cpath))
+
+	dirFd := C.opendir(Cpath)
+	if dirFd == nil {
+		return errors.New("dir not found while setting quota")
+	}
+	defer C.closedir(dirFd)
+
+	var args C.struct_btrfs_ioctl_qgroup_limit_args
+	args.lim.max_referenced = C.__u64(uint64(size))
+	args.lim.flags = C.BTRFS_QGROUP_LIMIT_MAX_RFER
+	_, _, err := unix.Syscall(unix.SYS_IOCTL, uintptr(C.dirfd(dirFd)), C.BTRFS_IOC_QGROUP_LIMIT,
+		uintptr(unsafe.Pointer(&args)))
+
+	if err != 0 {
+		return errors.Wrap(err, "error setting btrfs quota")
 	}
 	return nil
 }

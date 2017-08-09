@@ -1,0 +1,31 @@
+{
+	"description": "btrfs driver",
+	"documentation": "-",
+	"entrypoint": ["/docker-btrfs-volume"],
+	"interface": {
+		"types": ["docker.volumedriver/1.0"],
+		"socket": "btrfsvolume.sock"
+	},
+	"PropagatedMount": "/var/lib/butter",
+	"Linux": {
+		"Capabilities": ["CAP_SYS_ADMIN"]
+	},
+	"Env": [
+		{"Name": "BTRFS_DEVICE",
+		"Description": "set the btrfs device to use for volumes",
+		"Settable": ["value"],
+		"Value": ""},
+		{"Name": "BTRFS_MOUNT_OPTIONS",
+		"Description": "optional mount options for the btrfs device",
+		"Settable": ["value"],
+		"Value": ""}
+	],
+	"Mounts": [
+		{
+			"type": "bind",
+			"source": "/dev",
+			"destination": "/dev",
+			"options": ["rbind"]
+		}
+	]
+}
