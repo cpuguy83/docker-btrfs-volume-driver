@@ -77,6 +77,7 @@ func (v vol) Status() map[string]interface{} {
 		"Parent":     v.snapshot,
 		"SubvolInfo": info,
 		"QuotaBytes": v.quotaBytes,
+		"CreatedAt":  v.createdAt,
 	}
 }
 
@@ -141,6 +142,7 @@ func (d *driver) Create(name string, opts map[string]string) (volume.Volume, err
 			snapshot:   opts["from"],
 			path:       d.volumePath(name),
 			quotaBytes: quotaBytes,
+			createdAt:  time.Now(),
 		}
 		return saveVolume(tx, v)
 	})
@@ -149,15 +151,16 @@ func (d *driver) Create(name string, opts map[string]string) (volume.Volume, err
 
 func (d *driver) Remove(v volume.Volume) error {
 	err := d.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(volumesBucket).Delete([]byte(v.Name())); err != nil {
-			return errors.Wrap(err, "error deleting volume from db")
-		}
 		vo, err := getVolume(tx, v.Name())
 		if err != nil {
 			if err != notFound {
 				return err
 			}
 			return nil
+		}
+
+		if err := tx.Bucket(volumesBucket).Delete([]byte(v.Name())); err != nil {
+			return errors.Wrap(err, "error deleting volume from db")
 		}
 
 		if vo.snapshot != "" {
@@ -170,19 +173,17 @@ func (d *driver) Remove(v volume.Volume) error {
 			if err := saveVolume(tx, pv); err != nil {
 				return errors.Wrap(err, "error updating parent container")
 			}
-
-			if err := btrfs.SubvolDelete(dir); err != nil {
-				//if e := btrfs.IsSubvolume(dir); e == nil {
-				return errors.Wrap(err, "error removing subvolume")
-				//}
-			}
-
-			if vo.quotaBytes > 0 {
-				rescanQuota(d.dataRoot())
-			}
-			return nil
 		}
-		return err
+
+		if err := btrfs.SubvolDelete(vo.path); err != nil {
+			if e := btrfs.IsSubvolume(vo.path); e == nil {
+				return errors.Wrap(err, "error removing subvolume")
+			}
+		}
+		if vo.quotaBytes > 0 {
+			rescanQuota(d.dataRoot())
+		}
+		return nil
 	})
 	return err
 }
